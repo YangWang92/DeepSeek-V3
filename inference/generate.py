@@ -8,7 +8,7 @@ import torch
 import torch.distributed as dist
 from transformers import AutoTokenizer
 from safetensors.torch import load_model, safe_open
-
+import time
 from model import Transformer, ModelArgs
 
 def sample(logits, temperature: float = 1.0):
@@ -164,92 +164,19 @@ def offload_generate(
     print(f"offload_generate: {gpu_num}")
     print(model)
     
+    prompt = "DeepSeek Coder is a large language model developed by DeepSeek company."
+    messages = [{"role": "user", "content": prompt}]
+    prompt_tokens = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
+    completion_tokens = generate(model, [prompt_tokens], max_new_tokens, tokenizer.eos_token_id, temperature)
+    completion = tokenizer.decode(completion_tokens[0], skip_special_tokens=True)
+    print(messages)
+    print(completion)
     
-def parallel_load_model(model, ckpt_path, cpu_threads=32):
-    """
-    Load model weights in parallel using multiple threads with optimized performance.
-    """
-    import threading
-    from queue import Queue
-    import os
-    from safetensors.torch import safe_open
-    import time
-    
-    start_time = time.time()
-    files = sorted([f for f in os.listdir(ckpt_path) if f.startswith('model-') and f.endswith('.safetensors')])
-    print(f"Found {len(files)} weight files")
-    
-    file_queue = Queue()
-    result_queue = Queue()
-    
-    def worker(thread_id):
-        while True:
-            try:
-                filepath = os.path.join(ckpt_path, files[thread_id])
-                local_dict = {}
-                print(f"Thread {thread_id}: Loading file {filepath}")
-                with safe_open(filepath, framework="pt") as f:
-                    keys = list(f.keys())
-                    
-                    for k in keys:
-                        tensor = f.get_tensor(k).clone().to('cpu')
-                        local_dict[".".join(k.split('.')[1:])] = tensor
-                
-                result_queue.put((thread_id, local_dict))
-                # print(f"Thread {thread_id}: Loaded file {files[thread_id]}")
-            except Exception as e:
-                print(f"Error in thread {thread_id} loading {files[thread_id]}: {e}")
-                result_queue.put((thread_id, None))
-    
-    for i in range(len(files)):
-        file_queue.put(i)
-    
-    threads = []
-    num_threads = min(cpu_threads, len(files))
-    for i in range(num_threads):
-        t = threading.Thread(target=worker, args=(i,), daemon=True)
-        t.start()
-        threads.append(t)
-    
-    results = {}
-    total_size = 0
-    completed = 0
-    total_files = len(files)
-    
-    while completed < total_files:
-        idx, tensors = result_queue.get()
-        if tensors is not None:
-            results.update(tensors)
-            for tensor in tensors.values():
-                total_size += tensor.numel() * tensor.element_size()
-            completed += 1
-            print(f"Progress: {completed}/{total_files} files loaded. "
-                  f"Current size: {total_size / 1024**3:.2f} GB. "
-                  f"Time elapsed: {time.time() - start_time:.2f}s")
-    
-    for t in threads:
-        t.join()
-    
-    print(f"\nLoading completed in {time.time() - start_time:.2f} seconds")
-    print(f"Total loaded weights: {len(results)}")
-    print(f"Total size: {total_size / 1024**3:.2f} GB")
-    
-    print(results.keys())
-    
-    try:
-        model.load_state_dict(results, strict=True)
-        print("Successfully loaded model weights")
-    except Exception as e:
-        print(f"Error loading weights into model: {e}")
-        print('--------------------------------')
-        print(model.state_dict().keys())
-        raise
-
-    return model
 
 def main(
     ckpt_path: str,
     config: str,
+    tokenizer_path: str = None,
     input_file: str = "",
     interactive: bool = True,
     max_new_tokens: int = 100,
@@ -284,31 +211,34 @@ def main(
         torch.set_default_device("cpu")
 
     torch.set_default_dtype(torch.bfloat16)
+
     if offload is False:
         torch.set_num_threads(8)
     torch.manual_seed(965)
     with open(config) as f:
         args = ModelArgs(**json.load(f))
     print(args)
-    with torch.device("cuda" if offload is False else "cpu"):
-        model = Transformer(args)
-    tokenizer = AutoTokenizer.from_pretrained(ckpt_path)
-    
-    # tokenizer.decode(generate(model, [tokenizer.encode("DeepSeek")], 2, -1, 1.)[0])
-    # load_model(model, os.path.join(ckpt_path, f"model{rank}-mp{world_size}.safetensors"))
-    import time
-    start_time = time.time()
-    if offload:
-        parallel_load_model(model, ckpt_path, cpu_threads=cpu_threads)
+
+    # load tokenizer
+    if tokenizer_path is None:
+        tokenizer = AutoTokenizer.from_pretrained(ckpt_path)
     else:
-        load_model(model, os.path.join(ckpt_path, f"model{rank}-mp{world_size}.safetensors"))
+        print(f'load tokenizer from {tokenizer_path}')
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    
+    # load model
+    start_time = time.time()
+
+    print('load model')
+    if ckpt_path.endswith(".pt"):
+        model = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    else:
+        with torch.device("cuda" if offload is False else "cpu"):
+            model = Transformer(args)
+            load_model(model, os.path.join(ckpt_path, f"model{rank}-mp{world_size}.safetensors"))
     print(f"load_model time: {time.time() - start_time:.2f}s")
     
-    # import time
-    # start_time = time.time()
-    # load_model(model, os.path.join(ckpt_path, f"model{rank}-mp{world_size}.safetensors"))
-    # print(f"load_model time: {time.time() - start_time:.2f}s")
-    
+    # generate
     if offload is False:
         if interactive:
             interactive_generate(model, tokenizer, max_new_tokens, temperature, world_size, rank)
@@ -316,7 +246,8 @@ def main(
             batch_generate(model, tokenizer, input_file, max_new_tokens, temperature, args.max_batch_size)
     else:
         offload_generate(model, tokenizer, max_new_tokens, temperature, gpu_num)
-
+    
+    # clean up
     if world_size > 1:
         dist.destroy_process_group()
 
@@ -338,6 +269,7 @@ if __name__ == "__main__":
     """
     parser = ArgumentParser()
     parser.add_argument("--ckpt-path", type=str, required=True)
+    parser.add_argument("--tokenizer-path", type=str, default=None)
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--input-file", type=str, default="")
     parser.add_argument("--interactive", action="store_true")
@@ -347,5 +279,16 @@ if __name__ == "__main__":
     parser.add_argument("--gpu-num", type=int, default=4)
     parser.add_argument("--cpu-threads", type=int, default=8)
     args = parser.parse_args()
+    
     assert args.input_file or args.interactive or args.offload
-    main(args.ckpt_path, args.config, args.input_file, args.interactive, args.max_new_tokens, args.temperature, args.offload, args.gpu_num, args.cpu_threads)
+    main(ckpt_path=args.ckpt_path, 
+         tokenizer_path=args.tokenizer_path, 
+         config=args.config, 
+         input_file=args.input_file, 
+         interactive=args.interactive, 
+         max_new_tokens=args.max_new_tokens, 
+         temperature=args.temperature, 
+         offload=args.offload, 
+         gpu_num=args.gpu_num, 
+         cpu_threads=args.cpu_threads)
+
