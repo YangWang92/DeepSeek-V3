@@ -160,7 +160,8 @@ def offload_generate(
     prompt_tokens: List[List[int]],
     max_new_tokens: int,
     eos_id: int,
-    temperature: float = 1.0
+    temperature: float = 1.0,
+    offload_layers: int = 8
 ) -> List[List[int]]:
     prompt_lens = [len(t) for t in prompt_tokens]
     assert max(prompt_lens) <= model.max_seq_len
@@ -197,32 +198,39 @@ def offload_generate(
             if seqlen > 1:
                 mask = torch.full((seqlen, seqlen), float("-inf"), device="cpu").triu_(1)
 
-            layer_idx = 0
-            # Process each layer with distributed computation
-            for layer in model.layers:
+            # Process layers in groups of offload_layers size
+            total_layers = len(model.layers)
+            for start_idx in range(0, total_layers, offload_layers):
+                end_idx = min(start_idx + offload_layers, total_layers)
                 if rank == 0:
-                    print(f'layer {layer_idx} on device {device}')
-    
+                    print(f'Processing layers {start_idx} to {end_idx-1} on device {device}')
+                
+                # Move the current group of layers to GPU
+                current_layers = model.layers[start_idx:end_idx]
+                for layer in current_layers:
+                    layer.to(device)
+                
+                # Move tensors to GPU if needed
                 h = h.to(device)
-                layer = layer.to(device)
-
                 if freqs_cis is not None:
                     freqs_cis = freqs_cis.to(device)
                 if mask is not None:
                     mask = mask.to(device)
-                    
-                h = layer(h, _start_pos, freqs_cis, mask)
                 
-                if rank == 0:
-                    print(f'h {h.shape}')
-                    
-                # Move layer back to CPU
-                layer = layer.to("cpu")
-                layer_idx += 1
-           
+                # Process all layers in the current group
+                for layer_idx, layer in enumerate(current_layers, start=start_idx):
+                    if rank == 0:
+                        print(f'layer {layer_idx} processing')
+                    h = layer(h, _start_pos, freqs_cis, mask)
+                
+                # Move processed output back to CPU and clear GPU memory
+                # h = h.to("cpu")
+                for layer in current_layers:
+                    layer.to("cpu")
 
-            # Final operations on CPU
+            # Final operations on GPU
             model.norm = model.norm.to(device)
+            h = h.to(device)
             h = model.norm(h)[:, -1]
             model.head = model.head.to(device)
             logits = model.head(h)
@@ -268,19 +276,20 @@ def offload_inference(
     tokenizer,
     max_new_tokens: int,
     temperature: float,
-    gpu_num: int
+    gpu_num: int,
+    offload_layers: int
 ) -> None:
     # print(model)
     rank = torch.cuda.current_device()
     print(f'offload_inference: {rank}')
     
-    prompt = "DeepSeek V3 is a large language model developed by DeepSeek company."
+    prompt = "Once upon a time, "
     messages = [{"role": "user", "content": prompt}]
     if rank == 0:
         print(messages)
     prompt_tokens = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
     
-    completion_tokens = offload_generate(model, [prompt_tokens], max_new_tokens, tokenizer.eos_token_id, temperature)
+    completion_tokens = offload_generate(model, [prompt_tokens], max_new_tokens, tokenizer.eos_token_id, temperature, offload_layers)
     completion = tokenizer.decode(completion_tokens[0], skip_special_tokens=True)
     
     print(f'--- rank {rank} completion: {completion}')
@@ -296,6 +305,7 @@ def main(
     max_new_tokens: int = 200,
     temperature: float = 1.0,
     offload: bool = False,
+    offload_layers: int = 8,
     gpu_num: int = 4,
     dry_run: bool = False
 ) -> None:
@@ -310,6 +320,7 @@ def main(
         max_new_tokens (int, optional): Maximum number of new tokens to generate. Defaults to 100.
         temperature (float, optional): Temperature for sampling. Defaults to 1.0.
         offload (bool, optional): Whether to offload the model to CPU. Defaults to False.
+        offload_layers (int, optional): Number of layers to offload at a time. Defaults to 8.
     """
     # Always get distributed info
     world_size = int(os.getenv("WORLD_SIZE", "1"))
@@ -359,7 +370,7 @@ def main(
     
     # generate
     if offload:
-        offload_inference(model, tokenizer, max_new_tokens, temperature, gpu_num)
+        offload_inference(model, tokenizer, max_new_tokens, temperature, gpu_num, offload_layers)
     else:
         if interactive:
             interactive_generate(model, tokenizer, max_new_tokens, temperature, world_size, rank)
@@ -395,6 +406,7 @@ if __name__ == "__main__":
     parser.add_argument("--max-new-tokens", type=int, default=200)
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--offload", action="store_true")
+    parser.add_argument("--offload-layers", type=int, default=8)
     parser.add_argument("--gpu-num", type=int, default=4)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -408,6 +420,7 @@ if __name__ == "__main__":
          max_new_tokens=args.max_new_tokens, 
          temperature=args.temperature, 
          offload=args.offload, 
+         offload_layers=args.offload_layers,
          gpu_num=args.gpu_num, 
          dry_run=args.dry_run)
 
