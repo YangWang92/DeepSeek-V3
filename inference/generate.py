@@ -154,23 +154,137 @@ def batch_generate(
         print()
 
 
+@torch.inference_mode()
 def offload_generate(
+    model: Transformer,
+    prompt_tokens: List[List[int]],
+    max_new_tokens: int,
+    eos_id: int,
+    temperature: float = 1.0
+) -> List[List[int]]:
+    prompt_lens = [len(t) for t in prompt_tokens]
+    assert max(prompt_lens) <= model.max_seq_len
+    total_len = min(model.max_seq_len, max_new_tokens + max(prompt_lens))
+    
+    # Get current process's rank and world size
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    device = f'cuda:{rank}'  # Each process uses its own GPU
+    print(f'offload_generate: rank {rank} using device {device}')
+    
+    # Start on CPU
+    tokens = torch.full((len(prompt_tokens), total_len), -1, dtype=torch.long, device="cpu")
+    for i, t in enumerate(prompt_tokens):
+        tokens[i, :len(t)] = torch.tensor(t, dtype=torch.long, device="cpu")
+    prev_pos = 0
+    finished = torch.tensor([False] * len(prompt_tokens), device="cpu")
+    prompt_mask = tokens != -1
+    
+    for cur_pos in range(min(prompt_lens), total_len):
+        def _forward(model, tokens, start_pos):
+            _tokens = tokens[:, start_pos:cur_pos]
+            _start_pos = start_pos
+            seqlen = _tokens.size(1)
+            
+            # move to device
+            _tokens = _tokens.to(device)
+            model.embed = model.embed.to(device)
+            h = model.embed(_tokens)
+            model.embed = model.embed.to("cpu")
+            
+            freqs_cis = model.freqs_cis[_start_pos:_start_pos+seqlen]
+            mask = None
+            if seqlen > 1:
+                mask = torch.full((seqlen, seqlen), float("-inf"), device="cpu").triu_(1)
+
+            layer_idx = 0
+            # Process each layer with distributed computation
+            for layer in model.layers:
+                if rank == 0:
+                    print(f'layer {layer_idx} on device {device}')
+    
+                h = h.to(device)
+                layer = layer.to(device)
+
+                if freqs_cis is not None:
+                    freqs_cis = freqs_cis.to(device)
+                if mask is not None:
+                    mask = mask.to(device)
+                    
+                h = layer(h, _start_pos, freqs_cis, mask)
+                
+                if rank == 0:
+                    print(f'h {h.shape}')
+                    
+                # Move layer back to CPU
+                layer = layer.to("cpu")
+                layer_idx += 1
+           
+
+            # Final operations on CPU
+            model.norm = model.norm.to(device)
+            h = model.norm(h)[:, -1]
+            model.head = model.head.to(device)
+            logits = model.head(h)
+            
+            if world_size > 1:
+                all_logits = [torch.empty_like(logits) for _ in range(world_size)]
+                dist.all_gather(all_logits, logits)
+                logits = torch.cat(all_logits, dim=-1)
+            
+            model.norm = model.norm.to("cpu")
+            model.head = model.head.to("cpu")
+            return logits.to("cpu")
+        
+        logits = _forward(model, tokens, prev_pos)
+        
+        if temperature > 0:
+            next_token = sample(logits, temperature)
+        else:
+            next_token = logits.argmax(dim=-1)
+        
+        # move to cpu
+        prompt_mask = prompt_mask.to('cpu')
+        tokens = tokens.to('cpu')
+        next_token = next_token.to('cpu')
+        
+        next_token = torch.where(prompt_mask[:, cur_pos], tokens[:, cur_pos], next_token)
+        tokens[:, cur_pos] = next_token
+        finished |= torch.logical_and(~prompt_mask[:, cur_pos], next_token == eos_id)
+        prev_pos = cur_pos
+        if finished.all():
+            break
+    completion_tokens = []
+    for i, toks in enumerate(tokens.tolist()):
+        toks = toks[prompt_lens[i]:prompt_lens[i]+max_new_tokens]
+        if eos_id in toks:
+            toks = toks[:toks.index(eos_id)]
+        completion_tokens.append(toks)
+    return completion_tokens
+    
+
+def offload_inference(
     model: Transformer,
     tokenizer,
     max_new_tokens: int,
     temperature: float,
     gpu_num: int
 ) -> None:
-    print(f"offload_generate: {gpu_num}")
-    print(model)
+    # print(model)
+    rank = torch.cuda.current_device()
+    print(f'offload_inference: {rank}')
     
-    prompt = "DeepSeek Coder is a large language model developed by DeepSeek company."
+    prompt = "DeepSeek V3 is a large language model developed by DeepSeek company."
     messages = [{"role": "user", "content": prompt}]
+    if rank == 0:
+        print(messages)
     prompt_tokens = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
-    completion_tokens = generate(model, [prompt_tokens], max_new_tokens, tokenizer.eos_token_id, temperature)
+    
+    completion_tokens = offload_generate(model, [prompt_tokens], max_new_tokens, tokenizer.eos_token_id, temperature)
     completion = tokenizer.decode(completion_tokens[0], skip_special_tokens=True)
-    print(messages)
-    print(completion)
+    
+    print(f'--- rank {rank} completion: {completion}')
+    
     
 
 def main(
@@ -179,11 +293,11 @@ def main(
     tokenizer_path: str = None,
     input_file: str = "",
     interactive: bool = True,
-    max_new_tokens: int = 100,
+    max_new_tokens: int = 200,
     temperature: float = 1.0,
     offload: bool = False,
     gpu_num: int = 4,
-    cpu_threads: int = 48
+    dry_run: bool = False
 ) -> None:
     """
     Main function to load the model and perform interactive or batch text generation.
@@ -197,24 +311,25 @@ def main(
         temperature (float, optional): Temperature for sampling. Defaults to 1.0.
         offload (bool, optional): Whether to offload the model to CPU. Defaults to False.
     """
+    # Always get distributed info
     world_size = int(os.getenv("WORLD_SIZE", "1"))
     rank = int(os.getenv("RANK", "0"))
     local_rank = int(os.getenv("LOCAL_RANK", "0"))
+    
     if world_size > 1:
         dist.init_process_group("nccl")
+        torch.cuda.set_device(local_rank)  # Set device for NCCL
+    
+    # Set CPU threads based on mode
+    torch.set_num_threads(8)
+
     global print
     if rank != 0:
         print = lambda *_, **__: None
-    if offload is False:
-        torch.cuda.set_device(local_rank)
-    else:
-        torch.set_default_device("cpu")
 
     torch.set_default_dtype(torch.bfloat16)
-
-    if offload is False:
-        torch.set_num_threads(8)
     torch.manual_seed(965)
+    
     with open(config) as f:
         args = ModelArgs(**json.load(f))
     print(args)
@@ -228,24 +343,28 @@ def main(
     
     # load model
     start_time = time.time()
-
-    print('load model')
+    print(f'load model from rank {rank}')
+    
     if ckpt_path.endswith(".pt"):
         model = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     else:
-        with torch.device("cuda" if offload is False else "cpu"):
+        with torch.device("cpu"):  # Always load model to CPU first
             model = Transformer(args)
-            load_model(model, os.path.join(ckpt_path, f"model{rank}-mp{world_size}.safetensors"))
-    print(f"load_model time: {time.time() - start_time:.2f}s")
+            if not dry_run:
+                # Always load distributed model files
+                load_model(model, os.path.join(ckpt_path, f"model{rank}-mp{world_size}.safetensors"))
+                print(f"load_model time: {time.time() - start_time:.2f}s")
+            else:
+                print(f"dry run model load")
     
     # generate
-    if offload is False:
+    if offload:
+        offload_inference(model, tokenizer, max_new_tokens, temperature, gpu_num)
+    else:
         if interactive:
             interactive_generate(model, tokenizer, max_new_tokens, temperature, world_size, rank)
         else:
             batch_generate(model, tokenizer, input_file, max_new_tokens, temperature, args.max_batch_size)
-    else:
-        offload_generate(model, tokenizer, max_new_tokens, temperature, gpu_num)
     
     # clean up
     if world_size > 1:
@@ -277,7 +396,7 @@ if __name__ == "__main__":
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--offload", action="store_true")
     parser.add_argument("--gpu-num", type=int, default=4)
-    parser.add_argument("--cpu-threads", type=int, default=8)
+    parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     
     assert args.input_file or args.interactive or args.offload
@@ -290,5 +409,5 @@ if __name__ == "__main__":
          temperature=args.temperature, 
          offload=args.offload, 
          gpu_num=args.gpu_num, 
-         cpu_threads=args.cpu_threads)
+         dry_run=args.dry_run)
 
