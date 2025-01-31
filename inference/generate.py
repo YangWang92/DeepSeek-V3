@@ -9,7 +9,7 @@ import torch.distributed as dist
 from transformers import AutoTokenizer
 from safetensors.torch import load_model, safe_open
 import time
-from .model import Transformer, ModelArgs
+from inference.model import Transformer, ModelArgs
 
 def sample(logits, temperature: float = 1.0):
     """
