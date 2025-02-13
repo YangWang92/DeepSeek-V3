@@ -1,4 +1,3 @@
-from . import model
-from . import generate
+from deepseek.model import Transformer, ModelArgs
 
-__all__ = ['model', 'generate']
+__all__ = ['Transformer', 'ModelArgs', 'generate']

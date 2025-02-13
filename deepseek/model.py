@@ -7,7 +7,7 @@ from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
-from inference.kernel import act_quant, weight_dequant, fp8_gemm
+from deepseek.kernel import act_quant, weight_dequant, fp8_gemm
 
 
 world_size = 4
