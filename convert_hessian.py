@@ -12,18 +12,25 @@ mapping = {
     "embed_tokens": ("embed", 0),
     "input_layernorm": ("attn_norm", None),
     "post_attention_layernorm": ("ffn_norm", None),
-    "q_proj": ("wq", 0),
+    "q_proj": ("wq", None),
+    # "q_proj": ("wq", 0),
     "q_a_proj": ("wq_a", None),
     "q_a_layernorm": ("q_norm", None),
-    "q_b_proj": ("wq_b", 0),
+    "q_b_proj": ("wq_b", None),
+    # "q_b_proj": ("wq_b", 0),
     "kv_a_proj_with_mqa": ("wkv_a", None),
     "kv_a_layernorm": ("kv_norm", None),
-    "kv_b_proj": ("wkv_b", 0),
-    "o_proj": ("wo", 1),
+    "kv_b_proj": ("wkv_b", None),
+    # "kv_b_proj": ("wkv_b", 0),
+    "o_proj": ("wo", None),
+    # "o_proj": ("wo", 1),
     "gate": ("gate", None),
-    "gate_proj": ("w1", 0),
-    "down_proj": ("w2", 1),
-    "up_proj": ("w3", 0),
+    "gate_proj": ("w1", None),
+    # "gate_proj": ("w1", 0),
+    "down_proj": ("w2", None),
+    # "down_proj": ("w2", 1),
+    "up_proj": ("w3", None),
+    # "up_proj": ("w3", 0),
     "norm": ("norm", None),
     "lm_head": ("head", 0),
     "scale": ("scale", None),
@@ -70,16 +77,9 @@ def main(hf_ckpt_path, save_path, n_experts, mp):
                         if idx < i * n_local_experts or idx >= (i + 1) * n_local_experts:
                             continue
                     elif dim is not None:
-                        if dim == 0:
-                            assert param.size(dim) % mp == 0
-                            shard_size = param.size(dim) // mp
-                            new_param = param.narrow(dim, i * shard_size, shard_size).contiguous()
-                        else:
-                            # dim == 1, row parallel linear
-                            mp = 1
-                            assert param.size(dim) % mp == 0
-                            shard_size = param.size(dim) // mp
-                            new_param = param.narrow(dim, i * shard_size, shard_size).contiguous()
+                        assert param.size(dim) % mp == 0
+                        shard_size = param.size(dim) // mp
+                        new_param = param.narrow(dim, i * shard_size, shard_size).contiguous()
                     state_dicts[i][name] = new_param
 
     os.makedirs(save_path, exist_ok=True)

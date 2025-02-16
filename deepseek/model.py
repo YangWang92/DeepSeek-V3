@@ -12,6 +12,7 @@ from deepseek.kernel import act_quant, weight_dequant, fp8_gemm
 # world_size = 1
 # world_size = 4 for other linear
 world_size = 4
+linear_world_size = 1
 rank = 0
 block_size = 128
 gemm_impl: Literal["bf16", "fp8"] = "bf16"
@@ -414,7 +415,7 @@ class MLA(nn.Module):
         super().__init__()
         self.dim = args.dim
         self.n_heads = args.n_heads
-        self.n_local_heads = args.n_heads // world_size
+        self.n_local_heads = args.n_heads // linear_world_size
         self.q_lora_rank = args.q_lora_rank
         self.kv_lora_rank = args.kv_lora_rank
         self.qk_nope_head_dim = args.qk_nope_head_dim
@@ -423,14 +424,17 @@ class MLA(nn.Module):
         self.v_head_dim = args.v_head_dim
 
         if self.q_lora_rank == 0:
-            self.wq = ColumnParallelLinear(self.dim, self.n_heads * self.qk_head_dim)
+            # self.wq = ColumnParallelLinear(self.dim, self.n_heads * self.qk_head_dim)
+            self.wq = Linear(self.dim, self.n_heads * self.qk_head_dim)
         else:
             self.wq_a = Linear(self.dim, self.q_lora_rank)
             self.q_norm = RMSNorm(self.q_lora_rank)
-            self.wq_b = ColumnParallelLinear(self.q_lora_rank, self.n_heads * self.qk_head_dim)
+            # self.wq_b = ColumnParallelLinear(self.q_lora_rank, self.n_heads * self.qk_head_dim)
+            self.wq_b = Linear(self.q_lora_rank, self.n_heads * self.qk_head_dim)
         self.wkv_a = Linear(self.dim, self.kv_lora_rank + self.qk_rope_head_dim)
         self.kv_norm = RMSNorm(self.kv_lora_rank)
-        self.wkv_b = ColumnParallelLinear(self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim))
+        # self.wkv_b = ColumnParallelLinear(self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim))
+        self.wkv_b = Linear(self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim))
         # self.wo = RowParallelLinear(self.n_heads * self.v_head_dim, self.dim)
         self.wo = Linear(self.n_heads * self.v_head_dim, self.dim)
         self.softmax_scale = self.qk_head_dim ** -0.5
@@ -518,10 +522,12 @@ class MLP(nn.Module):
             inter_dim (int): Hidden layer dimensionality.
         """
         super().__init__()
-        self.w1 = ColumnParallelLinear(dim, inter_dim)
+        # self.w1 = ColumnParallelLinear(dim, inter_dim)
+        self.w1 = Linear(dim, inter_dim)
         # self.w2 = RowParallelLinear(inter_dim, dim)
         self.w2 = Linear(inter_dim, dim)
-        self.w3 = ColumnParallelLinear(dim, inter_dim)
+        # self.w3 = ColumnParallelLinear(dim, inter_dim)
+        self.w3 = Linear(dim, inter_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -770,6 +776,7 @@ class Transformer(nn.Module):
             self.layers.append(Block(layer_id, args))
         self.norm = RMSNorm(args.dim)
         self.head = ColumnParallelLinear(args.dim, args.vocab_size, dtype=torch.get_default_dtype())
+        # self.head = Linear(args.dim, args.vocab_size)
         self.register_buffer("freqs_cis", precompute_freqs_cis(args), persistent=False)
 
     @torch.inference_mode()
