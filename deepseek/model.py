@@ -9,7 +9,8 @@ import torch.distributed as dist
 
 from deepseek.kernel import act_quant, weight_dequant, fp8_gemm
 
-
+# world_size = 1
+# world_size = 4 for other linear
 world_size = 4
 rank = 0
 block_size = 128
@@ -430,7 +431,8 @@ class MLA(nn.Module):
         self.wkv_a = Linear(self.dim, self.kv_lora_rank + self.qk_rope_head_dim)
         self.kv_norm = RMSNorm(self.kv_lora_rank)
         self.wkv_b = ColumnParallelLinear(self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim))
-        self.wo = RowParallelLinear(self.n_heads * self.v_head_dim, self.dim)
+        # self.wo = RowParallelLinear(self.n_heads * self.v_head_dim, self.dim)
+        self.wo = Linear(self.n_heads * self.v_head_dim, self.dim)
         self.softmax_scale = self.qk_head_dim ** -0.5
         if args.max_seq_len > args.original_seq_len:
             mscale = 0.1 * args.mscale * math.log(args.rope_factor) + 1.0
@@ -517,7 +519,8 @@ class MLP(nn.Module):
         """
         super().__init__()
         self.w1 = ColumnParallelLinear(dim, inter_dim)
-        self.w2 = RowParallelLinear(inter_dim, dim)
+        # self.w2 = RowParallelLinear(inter_dim, dim)
+        self.w2 = Linear(inter_dim, dim)
         self.w3 = ColumnParallelLinear(dim, inter_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
