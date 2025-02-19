@@ -11,7 +11,7 @@ from deepseek.kernel import act_quant, weight_dequant, fp8_gemm
 
 # world_size = 1
 # world_size = 4 for other linear
-world_size = 4
+world_size = 2
 linear_world_size = 1
 rank = 0
 block_size = 128
