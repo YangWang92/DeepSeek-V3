@@ -8,7 +8,7 @@ from sympy import threaded
 import torch
 import torch.distributed as dist
 from transformers import AutoTokenizer
-from safetensors.torch import load_model, safe_open
+from safetensors.torch import load_model, safe_open, load_file
 import time
 from deepseek.model import Transformer, ModelArgs
 from vptq.layers.vqlinear import VQuantLinear
@@ -72,7 +72,7 @@ def get_quantized_deepseek(model, ckpt_path, quantize_args_path, world_size: int
     
     # load state dict
     if dry_run is False:
-        model_state_dict = torch.load(os.path.join(ckpt_path, f"model0-mp{world_size}.safetensors"), weights_only=False)
+        model_state_dict = load_file(os.path.join(ckpt_path, f"model0-mp{world_size}.safetensors"))
         model.load_state_dict(model_state_dict)
     print(f'quantized model: {model}')
     return model
