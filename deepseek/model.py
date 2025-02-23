@@ -10,7 +10,7 @@ import torch.distributed as dist
 from deepseek.kernel import act_quant, weight_dequant, fp8_gemm
 
 
-world_size = 4
+world_size = 1
 rank = 0
 block_size = 128
 gemm_impl: Literal["bf16", "fp8"] = "bf16"

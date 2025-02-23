@@ -1,6 +1,7 @@
 import os
 import json
 from argparse import ArgumentParser
+from sysconfig import get_path
 from typing import List
 
 from sympy import threaded
@@ -10,6 +11,72 @@ from transformers import AutoTokenizer
 from safetensors.torch import load_model, safe_open
 import time
 from deepseek.model import Transformer, ModelArgs
+from vptq.layers.vqlinear import VQuantLinear
+from deepseek.model import ColumnParallelLinear, RowParallelLinear, Linear
+from torch import nn
+
+def find_layers(module, target_layers=[nn.Linear], name=''):
+    if type(module) in target_layers:
+        return {name: module}
+    res = {}
+    for old_name, child in module.named_children():
+        res.update(find_layers(child, target_layers=target_layers, name=name + '.' + old_name if name != '' else old_name))
+    return res
+
+def replace_layer(module, target_name, layer, module_name=None):
+    for child_name, child_module in module.named_children():
+        current_name = child_name if module_name is None else f'{module_name}.{child_name}'
+        if target_name == current_name:
+            setattr(module, child_name, layer)
+            return True 
+        else:
+            if replace_layer(child_module, target_name, layer, current_name):
+                return True 
+    return False 
+
+def get_checkpoint_layer_list(path: str, num_layers: int=60) -> list[tuple[int, str, str]]:
+    layer_list = [] 
+    for i in range(num_layers):
+        layer_list.append((i, os.path.join(path, f"qlinear_args_{i}.pt")))
+    return layer_list
+
+def get_quantized_deepseek(model, ckpt_path, quantize_args_path, world_size: int=1, dry_run: bool=False, dtype=torch.bfloat16):
+    num_layers = len(model.layers)
+    layers = model.layers
+    target_layers = [ColumnParallelLinear, RowParallelLinear, Linear]
+    layer_list = get_checkpoint_layer_list(quantize_args_path, num_layers)
+    
+    for (layer_idx, layer_qlinear_args) in layer_list:
+        print(f'repalce layer {layer_idx}')
+        layer = layers[layer_idx]
+        
+        layer_qlinear_args = torch.load(layer_qlinear_args, weights_only=False)
+        
+        ops = find_layers(layer, target_layers)
+        
+        # print(f'ops from original model: {ops.keys()}')
+        # print(f'--------------------------------') 
+        for module_name, op in ops.items():
+            # init qlinear
+            # layer_qlinear_args[module_name]['norm_dim'] = 1
+            if 'norm_dim' in layer_qlinear_args[module_name]:
+                del layer_qlinear_args[module_name]['norm_dim']
+            qlinear = VQuantLinear(
+                **layer_qlinear_args[module_name],
+                dtype=dtype,
+            )
+            replace_layer(layer, module_name, qlinear)
+        
+        print(f'--------------------------------')
+        del layer_qlinear_args
+    
+    # load state dict
+    if dry_run is False:
+        model_state_dict = torch.load(os.path.join(ckpt_path, f"model0-mp{world_size}.safetensors"), weights_only=False)
+        model.load_state_dict(model_state_dict)
+    print(f'quantized model: {model}')
+    return model
+
 
 def sample(logits, temperature: float = 1.0):
     """
@@ -307,7 +374,9 @@ def main(
     offload: bool = False,
     offload_layers: int = 8,
     gpu_num: int = 4,
-    dry_run: bool = False
+    dry_run: bool = False,
+    quantize: bool = False,
+    quantize_args_path: str = ""
 ) -> None:
     """
     Main function to load the model and perform interactive or batch text generation.
@@ -361,13 +430,15 @@ def main(
     else:
         with torch.device("cpu"):  # Always load model to CPU first
             model = Transformer(args)
-            if not dry_run:
-                # Always load distributed model files
-                load_model(model, os.path.join(ckpt_path, f"model{rank}-mp{world_size}.safetensors"))
-                print(f"load_model time: {time.time() - start_time:.2f}s")
+            if quantize is False:
+                if not dry_run:
+                    # Always load distributed model files
+                    load_model(model, os.path.join(ckpt_path, f"model{rank}-mp{world_size}.safetensors"))
+                    print(f"load_model time: {time.time() - start_time:.2f}s")
+                else:
+                    print(f"dry run model load")
             else:
-                print(f"dry run model load")
-    
+                model = get_quantized_deepseek(model, ckpt_path, quantize_args_path, world_size=world_size, dry_run=dry_run, dtype=torch.bfloat16)
     # generate
     if offload:
         offload_inference(model, tokenizer, max_new_tokens, temperature, gpu_num, offload_layers)
@@ -409,6 +480,8 @@ if __name__ == "__main__":
     parser.add_argument("--offload-layers", type=int, default=8)
     parser.add_argument("--gpu-num", type=int, default=4)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--quantize", action="store_true")
+    parser.add_argument("--quantize-args-path", type=str, default="")
     args = parser.parse_args()
     
     assert args.input_file or args.interactive or args.offload
@@ -422,5 +495,7 @@ if __name__ == "__main__":
          offload=args.offload, 
          offload_layers=args.offload_layers,
          gpu_num=args.gpu_num, 
-         dry_run=args.dry_run)
+         dry_run=args.dry_run,
+         quantize=args.quantize,
+         quantize_args_path=args.quantize_args_path)
 
