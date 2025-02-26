@@ -61,6 +61,14 @@ def get_quantized_deepseek(model, ckpt_path, quantize_args_path, world_size: int
             # layer_qlinear_args[module_name]['norm_dim'] = 1
             if 'norm_dim' in layer_qlinear_args[module_name]:
                 del layer_qlinear_args[module_name]['norm_dim']
+            
+            #  overwrite config for absorbed perm and packed indice
+            layer_qlinear_args[module_name]['enable_perm'] = False
+            layer_qlinear_args[module_name]['is_indice_packed'] = True 
+            
+            # print(f'module_name: {module_name}') 
+            # print(f'layer_qlinear_args: {layer_qlinear_args[module_name]}')
+            # print(f'--------------------------------')
             qlinear = VQuantLinear(
                 **layer_qlinear_args[module_name],
                 dtype=dtype,
