@@ -9,8 +9,9 @@ import torch.distributed as dist
 
 from deepseek.kernel import act_quant, weight_dequant, fp8_gemm
 
+from vptq.layers.vqlinear import VQuantLinear
 
-world_size = 1
+world_size = 4
 rank = 0
 block_size = 128
 gemm_impl: Literal["bf16", "fp8"] = "bf16"
@@ -233,6 +234,49 @@ class ColumnParallelLinear(Linear):
         y = linear(x, self.weight, self.bias)
         return y
 
+class ColumnParallelVQLinear(VQuantLinear):
+    def __init__(self, 
+                 in_features: int, 
+                 out_features: int, 
+                 vector_lens: Tuple[int, int],
+                 num_centroids: Tuple[int, int],
+                 num_res_centroids: Tuple[int, int],
+                 group_num: int,
+                 group_size: int,
+                 outlier_size: int,
+                 enable_norm: bool = False,
+                 norm_dim: int = 0,
+                 enable_perm: bool = False,
+                 is_indice_packed: bool = False,
+                 bias: bool = False, 
+                 vector_quant_dim: str = "out",
+                 device=None,
+                 dtype=None,
+                 debug=False):
+        assert out_features % world_size == 0
+        
+        self.part_out_features = out_features // world_size
+        super().__init__(in_features, 
+                         self.part_out_features, 
+                         vector_lens, 
+                         num_centroids, 
+                         num_res_centroids, 
+                         group_num, 
+                         group_size, 
+                         outlier_size, 
+                         enable_norm, 
+                         norm_dim, 
+                         enable_perm, 
+                         is_indice_packed, 
+                         bias, 
+                         vector_quant_dim,
+                         device, 
+                         dtype, 
+                         debug)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = super().forward(x)
+        return y
 
 class RowParallelLinear(Linear):
     """
@@ -266,6 +310,53 @@ class RowParallelLinear(Linear):
             y += self.bias
         return y
 
+class RowParallelVQLinear(VQuantLinear):
+    def __init__(self, 
+                 in_features: int, 
+                 out_features: int, 
+                 vector_lens: Tuple[int, int],
+                 num_centroids: Tuple[int, int],
+                 num_res_centroids: Tuple[int, int],
+                 group_num: int,
+                 group_size: int,
+                 outlier_size: int,
+                 enable_norm: bool = False,
+                 norm_dim: int = 0,
+                 enable_perm: bool = False,
+                 is_indice_packed: bool = False,
+                 bias: bool = False, 
+                 vector_quant_dim: str = "out",
+                 device=None,
+                 dtype=None,
+                 debug=False):
+        assert in_features % world_size == 0
+        self.part_in_features = in_features // world_size
+        
+        super().__init__(self.part_in_features, 
+                         out_features, 
+                         vector_lens, 
+                         num_centroids, 
+                         num_res_centroids, 
+                         group_num, 
+                         group_size, 
+                         outlier_size, 
+                         enable_norm, 
+                         norm_dim, 
+                         enable_perm, 
+                         is_indice_packed, 
+                         bias, 
+                         vector_quant_dim, 
+                         device, 
+                         dtype, 
+                         debug)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = super().forward(x)
+        if world_size > 1:
+            dist.all_reduce(y)
+        if self.bias is not None:
+            y += self.bias
+        return y
 
 class RMSNorm(nn.Module):
     """
