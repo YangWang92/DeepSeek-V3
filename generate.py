@@ -422,7 +422,7 @@ def main(
         torch.cuda.set_device(local_rank)  # Set device for NCCL
     
     # Set CPU threads based on mode
-    torch.set_num_threads(64)
+    torch.set_num_threads(16)
 
     global print
     if rank != 0:
