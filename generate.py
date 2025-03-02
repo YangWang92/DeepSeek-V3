@@ -79,10 +79,8 @@ def get_quantized_deepseek(model, ckpt_path, quant_config,
                 if isinstance(op, Linear):
                     vqlinear = VQuantLinear(**op_args)
                 elif isinstance(op, ColumnParallelLinear):
-                    op_args['world_size'] = world_size
                     vqlinear = ColumnParallelVQLinear(**op_args)
                 elif isinstance(op, RowParallelLinear):
-                    op_args['world_size'] = world_size
                     vqlinear = RowParallelVQLinear(**op_args)
                 else:
                     raise ValueError(f'Unsupported layer type: {op_name} {op}')
