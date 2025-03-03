@@ -68,6 +68,7 @@ def get_quantized_deepseek(model, ckpt_path, quant_config,
 
     target_layers = [ColumnParallelLinear, RowParallelLinear, Linear]
     
+     
     for layer_idx in tqdm(range(num_layers), desc="Initializing"):
         # hack, all layers are the same vector length and num centroids
         if layer_idx <= 3:
@@ -76,12 +77,13 @@ def get_quantized_deepseek(model, ckpt_path, quant_config,
                 op_name = f'layers.{layer_idx}.{op_name}'
                 op_args = quant_config[op_name]
                 op_args = convert_str_to_dtypes(op_args)
-                if isinstance(op, Linear):
-                    vqlinear = VQuantLinear(**op_args)
-                elif isinstance(op, ColumnParallelLinear):
+               
+                if type(op) == ColumnParallelLinear:
                     vqlinear = ColumnParallelVQLinear(**op_args)
-                elif isinstance(op, RowParallelLinear):
+                elif type(op) == RowParallelLinear:
                     vqlinear = RowParallelVQLinear(**op_args)
+                elif type(op) == Linear:
+                    vqlinear = VQuantLinear(**op_args)
                 else:
                     raise ValueError(f'Unsupported layer type: {op_name} {op}')
                 replace_layer(model, op_name, vqlinear)

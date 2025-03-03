@@ -252,9 +252,11 @@ class ColumnParallelVQLinear(VQuantLinear):
                  vector_quant_dim: str = "out",
                  device=None,
                  dtype=None,
-                 debug=False):
+                 debug=False,
+                 indices_as_float=None,
+                 enable_proxy_error=False):
+
         assert out_features % world_size == 0
-        
         self.part_out_features = out_features // world_size
         super().__init__(in_features, 
                          self.part_out_features, 
@@ -272,7 +274,9 @@ class ColumnParallelVQLinear(VQuantLinear):
                          vector_quant_dim,
                          device, 
                          dtype, 
-                         debug)
+                         debug,
+                         indices_as_float,
+                         enable_proxy_error)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = super().forward(x)
@@ -328,9 +332,14 @@ class RowParallelVQLinear(VQuantLinear):
                  vector_quant_dim: str = "out",
                  device=None,
                  dtype=None,
-                 debug=False):
+                 debug=False,
+                 indices_as_float=None,
+                 enable_proxy_error=False):
+        
         assert in_features % world_size == 0
+        assert group_size % world_size == 0
         self.part_in_features = in_features // world_size
+        self.group_size = group_size // world_size
         
         super().__init__(self.part_in_features, 
                          out_features, 
@@ -338,7 +347,7 @@ class RowParallelVQLinear(VQuantLinear):
                          num_centroids, 
                          num_res_centroids, 
                          group_num, 
-                         group_size, 
+                         self.group_size, 
                          outlier_size, 
                          enable_norm, 
                          norm_dim, 
@@ -348,7 +357,9 @@ class RowParallelVQLinear(VQuantLinear):
                          vector_quant_dim, 
                          device, 
                          dtype, 
-                         debug)
+                         debug,
+                         indices_as_float,
+                         enable_proxy_error)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = super().forward(x)
@@ -847,7 +858,7 @@ class Transformer(nn.Module):
             args (ModelArgs): Model arguments containing transformer parameters.
         """
         global world_size, rank
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        # world_size = dist.get_world_size() if dist.is_initialized() else 1
         rank = dist.get_rank() if dist.is_initialized() else 0
         Linear.dtype = torch.float8_e4m3fn if args.dtype == "fp8" else torch.bfloat16
         super().__init__()
