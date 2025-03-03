@@ -12,11 +12,11 @@ from deepseek.kernel import act_quant, weight_dequant, fp8_gemm
 from vptq.layers.vqlinear import VQuantLinear
 
 world_size = 4
-rank = 0
+# rank = 0
 block_size = 128
 gemm_impl: Literal["bf16", "fp8"] = "bf16"
-attn_impl: Literal["naive", "absorb"] = "naive"
-# attn_impl: Literal["naive", "absorb"] = "absorb"
+attn_impl: Literal["naive", "absorb"] = "absorb"
+# attn_impl: Literal["naive", "absorb"] = "naive"
 
 @dataclass
 class ModelArgs:
@@ -580,7 +580,9 @@ class MLA(nn.Module):
             self.v_cache[:bsz, start_pos:end_pos] = v
             scores = torch.einsum("bshd,bthd->bsht", q, self.k_cache[:bsz, :end_pos]) * self.softmax_scale
         else:
-            wkv_b = self.wkv_b.weight if self.wkv_b.scale is None else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size) 
+            # wkv_b = self.wkv_b.weight if self.wkv_b.scale is None else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size) 
+            # hack for VPTQ
+            wkv_b = self.wkv_b.dequant()
             wkv_b = wkv_b.to(x.dtype)
             wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)
             q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :self.qk_nope_head_dim])

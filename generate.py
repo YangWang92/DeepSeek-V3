@@ -2,7 +2,7 @@ import os
 import json
 from argparse import ArgumentParser
 from sysconfig import get_path
-from typing import List
+from typing import List, Generator
 import copy
 
 from sympy import threaded
@@ -95,6 +95,7 @@ def get_quantized_deepseek(model, ckpt_path, quant_config,
     # load state dict
     if dry_run is False:
         model_state_dict = load_file(os.path.join(ckpt_path, f"model{rank}-mp{world_size}.safetensors"))
+        model.to('cuda')
         model.load_state_dict(model_state_dict)
     return model
 
@@ -121,20 +122,12 @@ def generate(
     prompt_tokens: List[List[int]],
     max_new_tokens: int,
     eos_id: int,
-    temperature: float = 1.0
-) -> List[List[int]]:
+    temperature: float = 1.0,
+    stream: bool = False
+) -> List[List[int]] | Generator[int, None, None]:
     """
     Generates new tokens based on the given prompt tokens using the specified model.
-
-    Args:
-        model (Transformer): The transformer model used for token generation.
-        prompt_tokens (List[List[int]]): A list of lists containing the prompt tokens for each sequence.
-        max_new_tokens (int): The maximum number of new tokens to generate.
-        eos_id (int): The end-of-sequence token ID.
-        temperature (float, optional): The temperature value for sampling. Defaults to 1.0.
-
-    Returns:
-        List[List[int]]: A list of lists containing the generated tokens for each sequence.
+    Added streaming support.
     """
     prompt_lens = [len(t) for t in prompt_tokens]
     assert max(prompt_lens) <= model.max_seq_len
@@ -145,6 +138,7 @@ def generate(
     prev_pos = 0
     finished = torch.tensor([False] * len(prompt_tokens), device="cuda")
     prompt_mask = tokens != -1
+
     for cur_pos in range(min(prompt_lens), total_len):
         logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
         if temperature > 0:
@@ -155,15 +149,21 @@ def generate(
         tokens[:, cur_pos] = next_token
         finished |= torch.logical_and(~prompt_mask[:, cur_pos], next_token == eos_id)
         prev_pos = cur_pos
+        
+        if stream:
+            yield next_token.item()
+            
         if finished.all():
             break
-    completion_tokens = []
-    for i, toks in enumerate(tokens.tolist()):
-        toks = toks[prompt_lens[i]:prompt_lens[i]+max_new_tokens]
-        if eos_id in toks:
-            toks = toks[:toks.index(eos_id)]
-        completion_tokens.append(toks)
-    return completion_tokens
+
+    if not stream:
+        completion_tokens = []
+        for i, toks in enumerate(tokens.tolist()):
+            toks = toks[prompt_lens[i]:prompt_lens[i]+max_new_tokens]
+            if eos_id in toks:
+                toks = toks[:toks.index(eos_id)]
+            completion_tokens.append(toks)
+        return completion_tokens
 
 
 def interactive_generate(
@@ -175,15 +175,7 @@ def interactive_generate(
     rank: int
 ) -> None:
     """
-    Handles interactive text generation mode.
-    
-    Args:
-        model (Transformer): The transformer model
-        tokenizer: The tokenizer for encoding/decoding text
-        max_new_tokens (int): Maximum number of tokens to generate
-        temperature (float): Temperature for sampling
-        world_size (int): Number of distributed processes
-        rank (int): Current process rank
+    Handles interactive text generation mode with streaming output.
     """
     messages = []
     while True:
@@ -206,10 +198,24 @@ def interactive_generate(
             
         messages.append({"role": "user", "content": prompt})
         prompt_tokens = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
-        completion_tokens = generate(model, [prompt_tokens], max_new_tokens, tokenizer.eos_token_id, temperature)
-        completion = tokenizer.decode(completion_tokens[0], skip_special_tokens=True)
-        print(completion)
+        
+        token_buffer = []
+        for token in generate(model, [prompt_tokens], max_new_tokens, 
+                            tokenizer.eos_token_id, temperature, stream=True):
+            token_buffer.append(token)
+            if len(token_buffer) >= 1:
+                text = tokenizer.decode(token_buffer, skip_special_tokens=True)
+                print(text, end="", flush=True)
+                token_buffer = []
+                
+        if token_buffer:
+            text = tokenizer.decode(token_buffer, skip_special_tokens=True)
+            print(text, end="", flush=True)
+        print() 
+        
+        completion = tokenizer.decode(token_buffer, skip_special_tokens=True)
         messages.append({"role": "assistant", "content": completion})
+
 
 def batch_generate(
     model: Transformer,
@@ -449,19 +455,18 @@ def main(
     if ckpt_path.endswith(".pt"):
         model = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     else:
-        with torch.device("cpu"):  # Always load model to CPU first
-            model = Transformer(args)
-            if quantize is False:
-                if not dry_run:
-                    # Always load distributed model files
-                    load_model(model, os.path.join(ckpt_path, f"model{rank}-mp{world_size}.safetensors"))
-                    print(f"load_model time: {time.time() - start_time:.2f}s")
-                else:
-                    print(f"dry run model load")
+        model = Transformer(args)
+        if quantize is False:
+            if not dry_run:
+                # Always load distributed model files
+                load_model(model, os.path.join(ckpt_path, f"model{rank}-mp{world_size}.safetensors"))
+                print(f"load_model time: {time.time() - start_time:.2f}s")
             else:
-                model = get_quantized_deepseek(model, ckpt_path, quant_config, 
-                                               world_size=world_size, rank=rank, 
-                                               dry_run=dry_run, dtype=torch.bfloat16)
+                print(f"dry run model load")
+        else:
+            model = get_quantized_deepseek(model, ckpt_path, quant_config, 
+                                           world_size=world_size, rank=rank, 
+                                           dry_run=dry_run, dtype=torch.bfloat16)
     # generate
     if offload:
         offload_inference(model, tokenizer, max_new_tokens, temperature, gpu_num, offload_layers)
