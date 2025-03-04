@@ -12,11 +12,10 @@ from deepseek.kernel import act_quant, weight_dequant, fp8_gemm
 from vptq.layers.vqlinear import VQuantLinear
 
 world_size = 4
-# rank = 0
+rank = 0
 block_size = 128
 gemm_impl: Literal["bf16", "fp8"] = "bf16"
 attn_impl: Literal["naive", "absorb"] = "absorb"
-# attn_impl: Literal["naive", "absorb"] = "naive"
 
 @dataclass
 class ModelArgs:
@@ -53,8 +52,7 @@ class ModelArgs:
         beta_slow (int): Slow beta correction factor.
         mscale (float): Scaling factor for extended attention.
     """
-    # max_batch_size: int = 8
-    max_batch_size: int = 1
+    max_batch_size: int = 8
     max_seq_len: int = 4096 * 4
     dtype: Literal["bf16", "fp8"] = "bf16"
     vocab_size: int = 102400
@@ -155,7 +153,6 @@ def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] =
         return F.linear(x, weight, bias)
     elif gemm_impl == "bf16":
         weight = weight_dequant(weight, weight.scale)
-        weight = weight.to(x.dtype)
         return F.linear(x, weight, bias)
     else:
         x, scale = act_quant(x, block_size)
@@ -583,7 +580,6 @@ class MLA(nn.Module):
             # wkv_b = self.wkv_b.weight if self.wkv_b.scale is None else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size) 
             # hack for VPTQ
             wkv_b = self.wkv_b.dequant()
-            wkv_b = wkv_b.to(x.dtype)
             wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)
             q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :self.qk_nope_head_dim])
             self.kv_cache[:bsz, start_pos:end_pos] = self.kv_norm(kv)
@@ -860,7 +856,7 @@ class Transformer(nn.Module):
             args (ModelArgs): Model arguments containing transformer parameters.
         """
         global world_size, rank
-        # world_size = dist.get_world_size() if dist.is_initialized() else 1
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
         rank = dist.get_rank() if dist.is_initialized() else 0
         Linear.dtype = torch.float8_e4m3fn if args.dtype == "fp8" else torch.bfloat16
         super().__init__()
