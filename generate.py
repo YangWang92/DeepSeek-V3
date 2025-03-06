@@ -1,6 +1,8 @@
+from email import generator
 import os
 import json
 from argparse import ArgumentParser
+from sys import argv
 from typing import List, Generator
 import copy
 
@@ -115,7 +117,7 @@ def sample(logits, temperature: float = 1.0):
 
 
 @torch.inference_mode()
-def generate(
+def _interactive_generate(
     model: Transformer,
     prompt_tokens: List[List[int]],
     max_new_tokens: int,
@@ -206,7 +208,7 @@ def interactive_generate(
         prompt_tokens = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
         
         token_buffer = []
-        for token in generate(model, [prompt_tokens], max_new_tokens, 
+        for token in _interactive_generate(model, [prompt_tokens], max_new_tokens, 
                             tokenizer.eos_token_id, temperature, stream=True):
             token_buffer.append(token)
             if len(token_buffer) >= 1:
@@ -222,6 +224,56 @@ def interactive_generate(
         completion = tokenizer.decode(token_buffer, skip_special_tokens=True)
         messages.append({"role": "assistant", "content": completion})
 
+@torch.inference_mode()
+def generate(
+    model: Transformer,
+    prompt_tokens: List[List[int]],
+    max_new_tokens: int,
+    eos_id: int,
+    temperature: float = 1.0
+) -> List[List[int]]:
+    """
+    Generates new tokens based on the given prompt tokens using the specified model.
+
+    Args:
+        model (Transformer): The transformer model used for token generation.
+        prompt_tokens (List[List[int]]): A list of lists containing the prompt tokens for each sequence.
+        max_new_tokens (int): The maximum number of new tokens to generate.
+        eos_id (int): The end-of-sequence token ID.
+        temperature (float, optional): The temperature value for sampling. Defaults to 1.0.
+
+    Returns:
+        List[List[int]]: A list of lists containing the generated tokens for each sequence.
+    """
+    prompt_lens = [len(t) for t in prompt_tokens]
+    assert max(prompt_lens) <= model.max_seq_len, f"Prompt length exceeds model maximum sequence length (max_seq_len={model.max_seq_len})"
+    total_len = min(model.max_seq_len, max_new_tokens + max(prompt_lens))
+    tokens = torch.full((len(prompt_tokens), total_len), -1, dtype=torch.long, device="cuda")
+    for i, t in enumerate(prompt_tokens):
+        tokens[i, :len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")
+    prev_pos = 0
+    finished = torch.tensor([False] * len(prompt_tokens), device="cuda")
+    prompt_mask = tokens != -1
+    for cur_pos in range(min(prompt_lens), total_len):
+        logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
+        if temperature > 0:
+            next_token = sample(logits, temperature)
+        else:
+            next_token = logits.argmax(dim=-1)
+        next_token = torch.where(prompt_mask[:, cur_pos], tokens[:, cur_pos], next_token)
+        tokens[:, cur_pos] = next_token
+        finished |= torch.logical_and(~prompt_mask[:, cur_pos], next_token == eos_id)
+        prev_pos = cur_pos
+        if finished.all():
+            break
+    completion_tokens = []
+    for i, toks in enumerate(tokens.tolist()):
+        toks = toks[prompt_lens[i]:prompt_lens[i]+max_new_tokens]
+        if eos_id in toks:
+            toks = toks[:toks.index(eos_id)]
+        completion_tokens.append(toks)
+    return completion_tokens
+
 
 def batch_generate(
     model: Transformer,
@@ -231,20 +283,9 @@ def batch_generate(
     temperature: float,
     max_batch_size: int
 ) -> None:
-    """
-    Handles batch text generation mode.
-    
-    Args:
-        model (Transformer): The transformer model
-        tokenizer: The tokenizer for encoding/decoding text
-        input_file (str): Path to file containing input prompts
-        max_new_tokens (int): Maximum number of tokens to generate
-        temperature (float): Temperature for sampling
-        max_batch_size (int): Maximum batch size for generation
-    """
     with open(input_file) as f:
         prompts = [line.strip() for line in f.readlines()]
-    assert len(prompts) <= max_batch_size
+    assert len(prompts) <= max_batch_size, f"Number of prompts exceeds maximum batch size ({max_batch_size})"
     prompt_tokens = [tokenizer.apply_chat_template([{"role": "user", "content": prompt}], add_generation_prompt=True) for prompt in prompts]
     completion_tokens = generate(model, prompt_tokens, max_new_tokens, tokenizer.eos_token_id, temperature)
     completions = tokenizer.batch_decode(completion_tokens, skip_special_tokens=True)
@@ -252,7 +293,11 @@ def batch_generate(
         print("Prompt:", prompt)
         print("Completion:", completion)
         print()
-
+    with open("output.txt", "w") as f:
+        for prompt, completion in zip(prompts, completions):
+            f.write(f"Prompt: {prompt}\n")
+            f.write(f"Completion: {completion}\n")
+            f.write("\n")
 
 def main(
     ckpt_path: str,
@@ -339,13 +384,17 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--input-file", type=str, default="")
     parser.add_argument("--interactive", action="store_true")
-    parser.add_argument("--max-new-tokens", type=int, default=200)
+    parser.add_argument("--max-new-tokens", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--quantize", action="store_true")
     parser.add_argument("--quant-config", type=str, default="")
     args = parser.parse_args()
-    
+     
     assert args.input_file or args.interactive
+    
+    os.environ['NCCL_DEBUG'] = 'NONE'
+    os.environ['TORCH_DISTRIBUTED_DEBUG'] = 'NONE'
+    
     main(ckpt_path=args.ckpt_path, 
          tokenizer_path=args.tokenizer_path, 
          config=args.config, 
