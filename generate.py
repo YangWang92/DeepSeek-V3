@@ -394,6 +394,9 @@ if __name__ == "__main__":
     
     os.environ['NCCL_DEBUG'] = 'NONE'
     os.environ['TORCH_DISTRIBUTED_DEBUG'] = 'NONE'
+    os.environ['TORCH_DISTRIBUTED_TIMEOUT'] = '3600'
+    os.environ['NCCL_TIMEOUT'] = '3600'
+    os.environ['NCCL_SOCKET_TIMEOUT'] = '360000'
     
     main(ckpt_path=args.ckpt_path, 
          tokenizer_path=args.tokenizer_path, 
