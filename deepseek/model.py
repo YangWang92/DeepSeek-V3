@@ -56,7 +56,7 @@ class ModelArgs:
         mscale (float): Scaling factor for extended attention.
     """
     max_batch_size: int = 1
-    max_seq_len: int = 65536
+    max_seq_len: int = 32768
     dtype: Literal["bf16", "fp8"] = "bf16"
     vocab_size: int = 102400
     dim: int = 2048
@@ -426,7 +426,7 @@ def vptq_dequant(linear: VQuantLinear) -> torch.Tensor:
     if residual_centroids is not None:
         enable_residual = True
         shape = (num_codebooks, num_res_centroids, vector_len)
-        residual_centroids_ = residual_centroids.view(shape)
+        residual_centroids_ = residual_centroids.weight.view(shape)
 
     outlier_centroids_ = None
     enable_outlier = False

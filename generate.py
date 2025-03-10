@@ -70,25 +70,41 @@ def get_quantized_deepseek(model, ckpt_path, quant_config,
      
     for layer_idx in tqdm(range(num_layers), desc="Initializing"):
         # hack, all layers are the same vector length and num centroids
-        if layer_idx <= 3:
-            ops = find_layers(layers[layer_idx], target_layers)
-            for op_name, op in ops.items():
-                op_name = f'layers.{layer_idx}.{op_name}'
-                op_args = quant_config[op_name]
-                op_args = convert_str_to_dtypes(op_args)
-                # drop norm_dim to workaround the config 
-                op_args.pop('norm_dim', None)
-                if type(op) == ColumnParallelLinear:
-                    vqlinear = ColumnParallelVQLinear(**op_args)
-                elif type(op) == RowParallelLinear:
-                    vqlinear = RowParallelVQLinear(**op_args)
-                elif type(op) == Linear:
-                    vqlinear = VQuantLinear(**op_args)
-                else:
-                    raise ValueError(f'Unsupported layer type: {op_name} {op}')
-                replace_layer(model, op_name, vqlinear)
-        else:
-            model.layers[layer_idx] = copy.deepcopy(model.layers[3])
+        ops = find_layers(layers[layer_idx], target_layers)
+        for op_name, op in ops.items():
+            op_name = f'layers.{layer_idx}.{op_name}'
+            op_args = quant_config[op_name]
+            op_args = convert_str_to_dtypes(op_args)
+            # drop norm_dim to workaround the config 
+            op_args.pop('norm_dim', None)
+            if type(op) == ColumnParallelLinear:
+                vqlinear = ColumnParallelVQLinear(**op_args)
+            elif type(op) == RowParallelLinear:
+                vqlinear = RowParallelVQLinear(**op_args)
+            elif type(op) == Linear:
+                vqlinear = VQuantLinear(**op_args)
+            else:
+                raise ValueError(f'Unsupported layer type: {op_name} {op}')
+            replace_layer(model, op_name, vqlinear)
+        # if layer_idx <= 3:
+        #     ops = find_layers(layers[layer_idx], target_layers)
+        #     for op_name, op in ops.items():
+        #         op_name = f'layers.{layer_idx}.{op_name}'
+        #         op_args = quant_config[op_name]
+        #         op_args = convert_str_to_dtypes(op_args)
+        #         # drop norm_dim to workaround the config 
+        #         op_args.pop('norm_dim', None)
+        #         if type(op) == ColumnParallelLinear:
+        #             vqlinear = ColumnParallelVQLinear(**op_args)
+        #         elif type(op) == RowParallelLinear:
+        #             vqlinear = RowParallelVQLinear(**op_args)
+        #         elif type(op) == Linear:
+        #             vqlinear = VQuantLinear(**op_args)
+        #         else:
+        #             raise ValueError(f'Unsupported layer type: {op_name} {op}')
+        #         replace_layer(model, op_name, vqlinear)
+        # else:
+        #     model.layers[layer_idx] = copy.deepcopy(model.layers[3])
     
     if rank == 0:    
         print(f'quantized model: {model}')
