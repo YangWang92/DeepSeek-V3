@@ -17,22 +17,65 @@ from torch import nn
 from tqdm import tqdm
 
 def find_layers(module, target_layers=[nn.Linear], name=''):
-    if type(module) in target_layers:
-        return {name: module}
-    res = {}
-    for old_name, child in module.named_children():
-        res.update(find_layers(child, target_layers=target_layers, name=name + '.' + old_name if name != '' else old_name))
-    return res
+    """Find all layers of specified types in a module using an iterative approach.
+    
+    Args:
+        module: The PyTorch module to search
+        target_layers: List of layer types to find
+        name: Prefix for layer names
+        
+    Returns:
+        Dictionary mapping layer names to layer instances
+    """
+    result = {}
+    # Use a stack for iterative traversal
+    stack = [(module, name)]
+    
+    while stack:
+        current_module, current_name = stack.pop()
+        
+        # Check if current module is a target
+        if type(current_module) in target_layers:
+            result[current_name] = current_module
+            continue
+            
+        # Add all children to the stack
+        for child_name, child_module in current_module.named_children():
+            child_full_name = child_name if current_name == '' else f'{current_name}.{child_name}'
+            stack.append((child_module, child_full_name))
+            
+    return result
 
 def replace_layer(module, target_name, layer, module_name=None):
-    for child_name, child_module in module.named_children():
-        current_name = child_name if module_name is None else f'{module_name}.{child_name}'
-        if target_name == current_name:
-            setattr(module, child_name, layer)
-            return True 
-        else:
-            if replace_layer(child_module, target_name, layer, current_name):
-                return True 
+    """Replace a layer in a module using an iterative approach.
+    
+    Args:
+        module: The PyTorch module to modify
+        target_name: Full name of the target layer
+        layer: New layer to replace the target
+        module_name: Current module name prefix
+        
+    Returns:
+        Boolean indicating whether the replacement was successful
+    """
+    # Use a queue for breadth-first traversal (faster for finding specific targets)
+    queue = [(module, None, module_name)]
+    
+    while queue:
+        current_module, parent_attr, current_module_name = queue.pop(0)
+        
+        # Check all children of the current module
+        for child_name, child_module in current_module.named_children():
+            full_name = child_name if current_module_name is None else f'{current_module_name}.{child_name}'
+            
+            # If this is the target, replace it
+            if full_name == target_name:
+                setattr(current_module, child_name, layer)
+                return True
+                
+            # Otherwise add it to the queue
+            queue.append((child_module, child_name, full_name))
+            
     return False
 
 def convert_str_to_dtypes(obj):
@@ -85,7 +128,7 @@ def get_quantized_deepseek(model, ckpt_path, quant_config,
                 vqlinear = VQuantLinear(**op_args)
             else:
                 raise ValueError(f'Unsupported layer type: {op_name} {op}')
-            replace_layer(model, op_name, vqlinear)
+            replace_layer(layers[layer_idx], op_name, vqlinear)
         # if layer_idx <= 3:
         #     ops = find_layers(layers[layer_idx], target_layers)
         #     for op_name, op in ops.items():
