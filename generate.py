@@ -85,7 +85,7 @@ def get_quantized_deepseek(model, ckpt_path, quant_config,
                 vqlinear = VQuantLinear(**op_args)
             else:
                 raise ValueError(f'Unsupported layer type: {op_name} {op}')
-            replace_layer(model, op_name, vqlinear)
+            replace_layer(layers[layer_idx], op_name, vqlinear)
         # if layer_idx <= 3:
         #     ops = find_layers(layers[layer_idx], target_layers)
         #     for op_name, op in ops.items():
