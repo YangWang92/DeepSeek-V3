@@ -17,22 +17,149 @@ from torch import nn
 from tqdm import tqdm
 
 def find_layers(module, target_layers=[nn.Linear], name=''):
-    if type(module) in target_layers:
-        return {name: module}
-    res = {}
-    for old_name, child in module.named_children():
-        res.update(find_layers(child, target_layers=target_layers, name=name + '.' + old_name if name != '' else old_name))
-    return res
+    """Find all layers of specified types in a module using an iterative approach.
+    
+    Args:
+        module: The PyTorch module to search
+        target_layers: List of layer types to find
+        name: Prefix for the layer names
+        
+    Returns:
+        Dictionary mapping layer names to layer instances
+    """
+    from collections import deque
+    
+    result = {}
+    # Use a deque for more efficient queue operations
+    queue = deque([(name, module)])
+    
+    while queue:
+        current_name, current_module = queue.popleft()  # More efficient than pop(0)
+        
+        # Check if current module is a target layer
+        if type(current_module) in target_layers:
+            result[current_name] = current_module
+            
+        # Add all children to the queue - only if they might contain target layers
+        for child_name, child_module in current_module.named_children():
+            next_name = child_name if current_name == '' else f'{current_name}.{child_name}'
+            queue.append((next_name, child_module))
+            
+    return result
+
+# Optimized version that directly accesses modules by path
+def find_layers_by_type(module, target_types):
+    """Find all layers of specified types in a module using a direct approach.
+    
+    Args:
+        module: The PyTorch module to search
+        target_types: List of layer types to find
+        
+    Returns:
+        Dictionary mapping layer paths to layer instances
+    """
+    result = {}
+    
+    # Helper function to recursively find layers
+    def _find_layers(m, path=''):
+        if type(m) in target_types:
+            result[path] = m
+            
+        for name, child in m.named_children():
+            child_path = name if path == '' else f'{path}.{name}'
+            _find_layers(child, child_path)
+    
+    _find_layers(module)
+    return result
+
+def build_module_path_map(module, prefix=''):
+    """Build a direct mapping from full path names to (parent_module, attribute_name) pairs.
+    
+    This allows direct access to any module without traversing the hierarchy each time.
+    
+    Args:
+        module: The PyTorch module to map
+        prefix: Prefix for the module names
+        
+    Returns:
+        Dictionary mapping full path names to (parent_module, attribute_name) pairs
+    """
+    from collections import deque
+    
+    path_map = {}
+    queue = deque([(prefix, module, None)])
+    
+    while queue:
+        current_prefix, current_module, parent_info = queue.popleft()
+        
+        if parent_info is not None:
+            parent_module, attr_name = parent_info
+            path_map[current_prefix] = (parent_module, attr_name)
+        
+        for child_name, child_module in current_module.named_children():
+            child_prefix = child_name if current_prefix == '' else f'{current_prefix}.{child_name}'
+            queue.append((child_prefix, child_module, (current_module, child_name)))
+            
+    return path_map
+
+def batch_replace_layers(module, replacements):
+    """Replace multiple layers in a single traversal.
+    
+    Args:
+        module: The PyTorch module to modify
+        replacements: Dictionary mapping layer names to new layers
+        
+    Returns:
+        Number of successful replacements
+    """
+    if not replacements:
+        return 0
+        
+    # Build a direct path map for efficient access
+    path_map = build_module_path_map(module)
+    
+    # Perform all replacements directly
+    successful = 0
+    for target_name, new_layer in replacements.items():
+        if target_name in path_map:
+            parent_module, attr_name = path_map[target_name]
+            setattr(parent_module, attr_name, new_layer)
+            successful += 1
+            
+    return successful
 
 def replace_layer(module, target_name, layer, module_name=None):
-    for child_name, child_module in module.named_children():
-        current_name = child_name if module_name is None else f'{module_name}.{child_name}'
-        if target_name == current_name:
-            setattr(module, child_name, layer)
-            return True 
-        else:
-            if replace_layer(child_module, target_name, layer, current_name):
-                return True 
+    """Replace a layer in a module using an iterative approach.
+    
+    Args:
+        module: The PyTorch module to modify
+        target_name: The name of the layer to replace
+        layer: The new layer to insert
+        module_name: Current module name prefix
+        
+    Returns:
+        Boolean indicating if replacement was successful
+    """
+    from collections import deque
+    
+    # Use a deque for more efficient queue operations
+    queue = deque([(module, None, module_name)])
+    
+    while queue:
+        current_module, parent_name, current_name = queue.popleft()  # More efficient than pop(0)
+        
+        # Check all children of the current module
+        for child_name, child_module in current_module.named_children():
+            full_name = child_name if current_name is None else f'{current_name}.{child_name}'
+            
+            # If this is the target layer, replace it
+            if full_name == target_name:
+                setattr(current_module, child_name, layer)
+                return True
+                
+            # Otherwise add it to the queue for further processing
+            queue.append((child_module, child_name, full_name))
+            
     return False
 
 def convert_str_to_dtypes(obj):
@@ -61,22 +188,42 @@ def get_layer_config(quant_config: str) -> list[tuple[int, str, str]]:
 def get_quantized_deepseek(model, ckpt_path, quant_config, 
                            world_size: int=1, rank: int=0,
                            dtype=torch.bfloat16):
+    import time
+    from tqdm import tqdm
+    import multiprocessing as mp
+    from functools import partial
+    
+    start_time = time.time()
+    
     num_layers = len(model.layers)
     layers = model.layers
     quant_config = get_layer_config(quant_config)
-
     target_layers = [ColumnParallelLinear, RowParallelLinear, Linear]
     
-     
-    for layer_idx in tqdm(range(num_layers), desc="Initializing"):
-        # hack, all layers are the same vector length and num centroids
+    # OPTIMIZATION 1: Pre-compute all layer configurations
+    layer_configs = {}
+    for key, config in quant_config.items():
+        if key.startswith('layers.'):
+            layer_configs[key] = config
+    
+    # OPTIMIZATION 2: Process all layers at once with a global path map
+    all_replacements = {}
+    
+    # Function to process a single layer
+    def process_layer(layer_idx):
+        layer_replacements = {}
+        # Find all target layers in this transformer layer
         ops = find_layers(layers[layer_idx], target_layers)
+        
         for op_name, op in ops.items():
-            op_name = f'layers.{layer_idx}.{op_name}'
-            op_args = quant_config[op_name]
+            full_op_name = f'layers.{layer_idx}.{op_name}'
+            if full_op_name not in layer_configs:
+                continue
+                
+            op_args = layer_configs[full_op_name]
             op_args = convert_str_to_dtypes(op_args)
-            # drop norm_dim to workaround the config 
             op_args.pop('norm_dim', None)
+            
             if type(op) == ColumnParallelLinear:
                 vqlinear = ColumnParallelVQLinear(**op_args)
             elif type(op) == RowParallelLinear:
@@ -84,29 +231,60 @@ def get_quantized_deepseek(model, ckpt_path, quant_config,
             elif type(op) == Linear:
                 vqlinear = VQuantLinear(**op_args)
             else:
-                raise ValueError(f'Unsupported layer type: {op_name} {op}')
-            replace_layer(model, op_name, vqlinear)
-        # if layer_idx <= 3:
-        #     ops = find_layers(layers[layer_idx], target_layers)
-        #     for op_name, op in ops.items():
-        #         op_name = f'layers.{layer_idx}.{op_name}'
-        #         op_args = quant_config[op_name]
-        #         op_args = convert_str_to_dtypes(op_args)
-        #         # drop norm_dim to workaround the config 
-        #         op_args.pop('norm_dim', None)
-        #         if type(op) == ColumnParallelLinear:
-        #             vqlinear = ColumnParallelVQLinear(**op_args)
-        #         elif type(op) == RowParallelLinear:
-        #             vqlinear = RowParallelVQLinear(**op_args)
-        #         elif type(op) == Linear:
-        #             vqlinear = VQuantLinear(**op_args)
-        #         else:
-        #             raise ValueError(f'Unsupported layer type: {op_name} {op}')
-        #         replace_layer(model, op_name, vqlinear)
-        # else:
-        #     model.layers[layer_idx] = copy.deepcopy(model.layers[3])
+                continue
+                
+            layer_replacements[op_name] = vqlinear
+        
+        return layer_idx, layer_replacements
     
-    if rank == 0:    
+    # OPTIMIZATION 3: Use multiprocessing for parallel layer processing
+    # Only use multiprocessing if we have many layers and not in distributed mode
+    use_mp = num_layers > 16 and world_size == 1
+    
+    if use_mp and mp.get_start_method(allow_none=True) is None:
+        try:
+            mp.set_start_method('spawn')
+        except RuntimeError:
+            use_mp = False
+    
+    if use_mp:
+        # Process layers in parallel
+        with mp.Pool(processes=min(mp.cpu_count(), 8)) as pool:
+            results = list(tqdm(
+                pool.imap(process_layer, range(num_layers)),
+                total=num_layers,
+                desc="Preparing layer replacements"
+            ))
+            
+        # Collect all replacements
+        for layer_idx, replacements in results:
+            for op_name, vqlinear in replacements.items():
+                all_replacements[f'layers.{layer_idx}.{op_name}'] = (layer_idx, op_name, vqlinear)
+    else:
+        # Process layers sequentially but with optimized data structures
+        for layer_idx in tqdm(range(num_layers), desc="Preparing layer replacements"):
+            layer_idx, replacements = process_layer(layer_idx)
+            for op_name, vqlinear in replacements.items():
+                all_replacements[f'layers.{layer_idx}.{op_name}'] = (layer_idx, op_name, vqlinear)
+    
+    # OPTIMIZATION 4: Apply all replacements at once using direct access
+    if rank == 0:
+        print(f"Applying {len(all_replacements)} layer replacements...")
+    
+    # Group replacements by layer for more efficient processing
+    layer_grouped_replacements = {}
+    for full_name, (layer_idx, op_name, vqlinear) in all_replacements.items():
+        if layer_idx not in layer_grouped_replacements:
+            layer_grouped_replacements[layer_idx] = {}
+        layer_grouped_replacements[layer_idx][op_name] = vqlinear
+    
+    # Apply replacements layer by layer
+    for layer_idx, replacements in tqdm(layer_grouped_replacements.items(), desc="Applying replacements"):
+        batch_replace_layers(layers[layer_idx], replacements)
+    
+    elapsed = time.time() - start_time
+    if rank == 0:
+        print(f'Layer replacement completed in {elapsed:.2f} seconds')
         print(f'quantized model: {model}')
     
     # load state dict
