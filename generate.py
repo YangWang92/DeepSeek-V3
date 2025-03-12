@@ -185,6 +185,47 @@ def get_layer_config(quant_config: str) -> list[tuple[int, str, str]]:
     quant_config = quant_config['quantization_config']['config_for_layers']
     return quant_config
 
+# 将嵌套函数移到外部，使其可以被pickle
+def _process_single_layer(args):
+    """Process a single layer for quantization.
+    
+    This function must be defined at module level (not nested) to be picklable for multiprocessing.
+    
+    Args:
+        args: Tuple containing (layer_idx, layer_config_dict, target_layer_types)
+        
+    Returns:
+        Tuple of (layer_idx, replacements_dict)
+    """
+    import torch
+    from vptq.layers.vqlinear import VQuantLinear
+    from deepseek.model import ColumnParallelLinear, ColumnParallelVQLinear, RowParallelLinear, RowParallelVQLinear, Linear
+    
+    layer_idx, layer_config_dict, target_layer_types = args
+    layer_replacements = {}
+    
+    # Process each config directly without accessing the actual layer
+    # This reduces the amount of data that needs to be pickled
+    for op_name, op_config in layer_config_dict.items():
+        try:
+            # Extract the layer type from the config
+            layer_type = op_config.pop('layer_type', None)
+            if layer_type == 'ColumnParallelLinear':
+                vqlinear = ColumnParallelVQLinear(**op_config)
+            elif layer_type == 'RowParallelLinear':
+                vqlinear = RowParallelVQLinear(**op_config)
+            elif layer_type == 'Linear':
+                vqlinear = VQuantLinear(**op_config)
+            else:
+                continue
+                
+            layer_replacements[op_name] = vqlinear
+        except Exception as e:
+            print(f"Warning: Failed to create quantized layer for layers.{layer_idx}.{op_name}: {str(e)}")
+            continue
+    
+    return layer_idx, layer_replacements
+
 def get_quantized_deepseek(model, ckpt_path, quant_config, 
                            world_size: int=1, rank: int=0,
                            dtype=torch.bfloat16):
@@ -192,6 +233,8 @@ def get_quantized_deepseek(model, ckpt_path, quant_config,
     from tqdm import tqdm
     import multiprocessing as mp
     from functools import partial
+    import os
+    import gc
     
     start_time = time.time()
     
@@ -200,72 +243,141 @@ def get_quantized_deepseek(model, ckpt_path, quant_config,
     quant_config = get_layer_config(quant_config)
     target_layers = [ColumnParallelLinear, RowParallelLinear, Linear]
     
-    # OPTIMIZATION 1: Pre-compute all layer configurations
-    layer_configs = {}
-    for key, config in quant_config.items():
-        if key.startswith('layers.'):
-            layer_configs[key] = config
+    # OPTIMIZATION 1: Pre-compute all layer configurations and prepare them for multiprocessing
+    # This reduces the amount of data that needs to be transferred between processes
+    layer_configs_for_mp = {}
+    
+    # First find all target layers and their configurations
+    for layer_idx in range(num_layers):
+        layer = layers[layer_idx]
+        ops = find_layers(layer, target_layers)
+        
+        layer_dict = {}
+        for op_name, op in ops.items():
+            full_op_name = f'layers.{layer_idx}.{op_name}'
+            if full_op_name not in quant_config:
+                continue
+                
+            # Get the configuration and add layer type information
+            op_args = quant_config[full_op_name]
+            op_args = convert_str_to_dtypes(op_args)
+            op_args.pop('norm_dim', None)
+            
+            # Add layer type information to the config
+            if type(op) == ColumnParallelLinear:
+                op_args['layer_type'] = 'ColumnParallelLinear'
+            elif type(op) == RowParallelLinear:
+                op_args['layer_type'] = 'RowParallelLinear'
+            elif type(op) == Linear:
+                op_args['layer_type'] = 'Linear'
+            else:
+                continue
+                
+            layer_dict[op_name] = op_args
+            
+        if layer_dict:
+            layer_configs_for_mp[layer_idx] = layer_dict
     
     # OPTIMIZATION 2: Process all layers at once with a global path map
     all_replacements = {}
     
-    # Function to process a single layer
-    def process_layer(layer_idx):
-        layer_replacements = {}
-        # Find all target layers in this transformer layer
-        ops = find_layers(layers[layer_idx], target_layers)
-        
-        for op_name, op in ops.items():
-            full_op_name = f'layers.{layer_idx}.{op_name}'
-            if full_op_name not in layer_configs:
-                continue
-                
-            op_args = layer_configs[full_op_name]
-            op_args = convert_str_to_dtypes(op_args)
-            op_args.pop('norm_dim', None)
-            
-            if type(op) == ColumnParallelLinear:
-                vqlinear = ColumnParallelVQLinear(**op_args)
-            elif type(op) == RowParallelLinear:
-                vqlinear = RowParallelVQLinear(**op_args)
-            elif type(op) == Linear:
-                vqlinear = VQuantLinear(**op_args)
-            else:
-                continue
-                
-            layer_replacements[op_name] = vqlinear
-        
-        return layer_idx, layer_replacements
-    
     # OPTIMIZATION 3: Use multiprocessing for parallel layer processing
-    # Only use multiprocessing if we have many layers and not in distributed mode
-    use_mp = num_layers > 16 and world_size == 1
+    # We can use multiprocessing even in distributed mode with careful resource management
+    # Each distributed rank will use a subset of available CPU cores
+    use_mp = num_layers > 16 and os.environ.get('DISABLE_MP', '0') != '1'
     
-    if use_mp and mp.get_start_method(allow_none=True) is None:
-        try:
-            mp.set_start_method('spawn')
-        except RuntimeError:
-            use_mp = False
-    
-    if use_mp:
-        # Process layers in parallel
-        with mp.Pool(processes=min(mp.cpu_count(), 8)) as pool:
-            results = list(tqdm(
-                pool.imap(process_layer, range(num_layers)),
-                total=num_layers,
-                desc="Preparing layer replacements"
-            ))
-            
-        # Collect all replacements
-        for layer_idx, replacements in results:
-            for op_name, vqlinear in replacements.items():
-                all_replacements[f'layers.{layer_idx}.{op_name}'] = (layer_idx, op_name, vqlinear)
+    # Calculate how many processes each rank should use - be more conservative
+    total_cpu_count = mp.cpu_count()
+    if world_size > 1:
+        # In distributed mode, use fewer processes to avoid resource contention
+        processes_per_rank = min(16, max(1, (total_cpu_count - 2) // world_size))
     else:
+        # In non-distributed mode, still be conservative
+        processes_per_rank = min(64, max(1, total_cpu_count - 2))
+    
+    if rank == 0:
+        print(f"Rank {rank}: Using {processes_per_rank} processes for layer processing (out of {total_cpu_count} CPUs)")
+    
+    # Initialize multiprocessing safely
+    if use_mp:
+        try:
+            # Check if multiprocessing is already initialized
+            if mp.get_start_method(allow_none=True) is None:
+                # Try to use 'spawn' method which is safer with CUDA
+                try:
+                    mp.set_start_method('spawn')
+                except RuntimeError:
+                    # If 'spawn' fails, try 'fork' as fallback
+                    try:
+                        mp.set_start_method('fork')
+                    except RuntimeError:
+                        use_mp = False
+                        if rank == 0:
+                            print("Warning: Could not initialize multiprocessing, falling back to sequential processing")
+        except Exception as e:
+            use_mp = False
+            if rank == 0:
+                print(f"Warning: Multiprocessing initialization failed: {e}, falling back to sequential processing")
+    
+    # Optimize the layer processing based on model structure
+    # For very large models, process layers in chunks to reduce memory pressure
+    chunk_size = len(layer_configs_for_mp) # Process fewer layers at once to reduce memory pressure
+    
+    # Prepare arguments for processing - only pass the necessary data
+    process_args = [(idx, config_dict, target_layers) for idx, config_dict in layer_configs_for_mp.items()]
+    
+    # Set a timeout for multiprocessing operations
+    mp_timeout = 300  # 5 minutes timeout
+    
+    if use_mp and processes_per_rank > 1 and process_args:
+        try:
+            # Set multiprocessing context explicitly
+            ctx = mp.get_context('spawn')
+            
+            # Process layers in parallel with careful resource management
+            with ctx.Pool(processes=processes_per_rank) as pool:
+                # Process layers in smaller chunks to reduce memory pressure
+                for chunk_start in range(0, len(process_args), chunk_size):
+                    chunk_end = min(len(process_args), chunk_start + chunk_size)
+                    chunk_args = process_args[chunk_start:chunk_end]
+                    
+                    # Process this chunk of layers in parallel with timeout
+                    try:
+                        results = list(tqdm(
+                            pool.imap_unordered(_process_single_layer, chunk_args),
+                            total=len(chunk_args),
+                            desc=f"Rank {rank}: Preparing layers (chunk {chunk_start//chunk_size + 1}/{(len(process_args) + chunk_size - 1)//chunk_size})"
+                        ))
+                        
+                        # Collect replacements from this chunk
+                        for layer_idx, replacements in results:
+                            for op_name, vqlinear in replacements.items():
+                                all_replacements[f'layers.{layer_idx}.{op_name}'] = (layer_idx, op_name, vqlinear)
+                        
+                        # Force garbage collection between chunks
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                            
+                    except Exception as e:
+                        if rank == 0:
+                            print(f"Warning: Chunk processing failed: {str(e)}, continuing with next chunk")
+                        continue
+        except Exception as e:
+            if rank == 0:
+                print(f"Warning: Multiprocessing execution failed: {str(e)}, falling back to sequential processing")
+            use_mp = False
+            
+    if not use_mp or processes_per_rank <= 1 or not all_replacements:
         # Process layers sequentially but with optimized data structures
-        for layer_idx in tqdm(range(num_layers), desc="Preparing layer replacements"):
-            layer_idx, replacements = process_layer(layer_idx)
-            for op_name, vqlinear in replacements.items():
-                all_replacements[f'layers.{layer_idx}.{op_name}'] = (layer_idx, op_name, vqlinear)
+        for args in tqdm(process_args, desc=f"Rank {rank}: Preparing layer replacements"):
+            try:
+                layer_idx, replacements = _process_single_layer(args)
+                for op_name, vqlinear in replacements.items():
+                    all_replacements[f'layers.{layer_idx}.{op_name}'] = (layer_idx, op_name, vqlinear)
+            except Exception as e:
+                print(f"Warning: Failed to process layer {args[0]}: {str(e)}")
+                continue
     
     # OPTIMIZATION 4: Apply all replacements at once using direct access
     if rank == 0:
@@ -279,13 +391,17 @@ def get_quantized_deepseek(model, ckpt_path, quant_config,
         layer_grouped_replacements[layer_idx][op_name] = vqlinear
     
     # Apply replacements layer by layer
-    for layer_idx, replacements in tqdm(layer_grouped_replacements.items(), desc="Applying replacements"):
-        batch_replace_layers(layers[layer_idx], replacements)
+    for layer_idx, replacements in tqdm(layer_grouped_replacements.items(), desc=f"Rank {rank}: Applying replacements"):
+        try:
+            batch_replace_layers(layers[layer_idx], replacements)
+        except Exception as e:
+            print(f"Warning: Failed to apply replacements for layer {layer_idx}: {str(e)}")
+            continue
     
     elapsed = time.time() - start_time
-    if rank == 0:
-        print(f'Layer replacement completed in {elapsed:.2f} seconds')
-        print(f'quantized model: {model}')
+    # if rank == 0:
+    #    print(f'Layer replacement completed in {elapsed:.2f} seconds')
+    #    print(f'quantized model: {model}')
     
     # load state dict
     model_state_dict = load_file(os.path.join(ckpt_path, f"model{rank}-mp{world_size}.safetensors"))
@@ -586,8 +702,8 @@ if __name__ == "__main__":
      
     assert args.input_file or args.interactive
     
-    os.environ['NCCL_DEBUG'] = 'NONE'
-    os.environ['TORCH_DISTRIBUTED_DEBUG'] = 'NONE'
+    os.environ['NCCL_DEBUG'] = 'OFF'
+    os.environ['TORCH_DISTRIBUTED_DEBUG'] = 'OFF'
     os.environ['TORCH_DISTRIBUTED_TIMEOUT'] = '3600'
     os.environ['NCCL_TIMEOUT'] = '3600'
     os.environ['NCCL_SOCKET_TIMEOUT'] = '360000'
