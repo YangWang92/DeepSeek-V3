@@ -228,7 +228,8 @@ def _process_single_layer(args):
 
 def get_quantized_deepseek(model, ckpt_path, quant_config, 
                            world_size: int=1, rank: int=0,
-                           dtype=torch.bfloat16):
+                           dtype=torch.bfloat16,
+                           num_load_processes: int = 1):
     import time
     from tqdm import tqdm
     import multiprocessing as mp
@@ -284,17 +285,19 @@ def get_quantized_deepseek(model, ckpt_path, quant_config,
     # OPTIMIZATION 3: Use multiprocessing for parallel layer processing
     # We can use multiprocessing even in distributed mode with careful resource management
     # Each distributed rank will use a subset of available CPU cores
-    use_mp = num_layers > 16 and os.environ.get('DISABLE_MP', '0') != '1'
+    use_mp = num_layers > 16 and os.environ.get('DISABLE_MP', '0') != '1' and num_load_processes > 1
     
     # Calculate how many processes each rank should use - be more conservative
     total_cpu_count = mp.cpu_count()
     if world_size > 1:
         # In distributed mode, use fewer processes to avoid resource contention
         processes_per_rank = min(16, max(1, (total_cpu_count - 2) // world_size))
+        processes_per_rank = min(processes_per_rank, num_load_processes)
     else:
         # In non-distributed mode, still be conservative
         processes_per_rank = min(64, max(1, total_cpu_count - 2))
-    
+        processes_per_rank = min(processes_per_rank, num_load_processes)
+
     if rank == 0:
         print(f"Rank {rank}: Using {processes_per_rank} processes for layer processing (out of {total_cpu_count} CPUs)")
     
@@ -596,7 +599,8 @@ def main(
     max_new_tokens: int = 100,
     temperature: float = 1.0,
     quantize: bool = False,
-    quant_config: str = ""
+    quant_config: str = "",
+    num_load_processes: int = 1
 ) -> None:
     """
     Main function to load the model and perform interactive or batch text generation.
@@ -640,7 +644,8 @@ def main(
     else:
         model = get_quantized_deepseek(model, ckpt_path, quant_config, 
                                        world_size=world_size, rank=rank, 
-                                       dtype=torch.bfloat16)
+                                       dtype=torch.bfloat16,
+                                       num_load_processes=num_load_processes)
     
     if interactive:
         interactive_generate(model, tokenizer, max_new_tokens, temperature, world_size, rank)
@@ -676,6 +681,7 @@ if __name__ == "__main__":
     parser.add_argument("--temperature", type=float, default=0.15)
     parser.add_argument("--quantize", action="store_true")
     parser.add_argument("--quant-config", type=str, default="")
+    parser.add_argument("--num-load-processes", type=int, default=1)
     args = parser.parse_args()
      
     assert args.input_file or args.interactive
@@ -694,4 +700,5 @@ if __name__ == "__main__":
          max_new_tokens=args.max_new_tokens, 
          temperature=args.temperature, 
          quantize=args.quantize,
-         quant_config=args.quant_config)
+         quant_config=args.quant_config,
+         num_load_processes=args.num_load_processes)
