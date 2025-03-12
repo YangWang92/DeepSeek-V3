@@ -319,89 +319,67 @@ def get_quantized_deepseek(model, ckpt_path, quant_config,
             if rank == 0:
                 print(f"Warning: Multiprocessing initialization failed: {e}, falling back to sequential processing")
     
-    # Optimize the layer processing based on model structure
-    # For very large models, process layers in chunks to reduce memory pressure
-    chunk_size = len(layer_configs_for_mp) # Process fewer layers at once to reduce memory pressure
+    chunk_size = len(layer_configs_for_mp)
     
-    # Prepare arguments for processing - only pass the necessary data
     process_args = [(idx, config_dict, target_layers) for idx, config_dict in layer_configs_for_mp.items()]
-    
-    # Set a timeout for multiprocessing operations
-    mp_timeout = 300  # 5 minutes timeout
     
     if use_mp and processes_per_rank > 1 and process_args:
         try:
-            # Set multiprocessing context explicitly
             ctx = mp.get_context('spawn')
             
-            # Process layers in parallel with careful resource management
             with ctx.Pool(processes=processes_per_rank) as pool:
-                # Process layers in smaller chunks to reduce memory pressure
-                for chunk_start in range(0, len(process_args), chunk_size):
-                    chunk_end = min(len(process_args), chunk_start + chunk_size)
-                    chunk_args = process_args[chunk_start:chunk_end]
+                try:
+                    results = list(tqdm(
+                        pool.imap_unordered(_process_single_layer, process_args),
+                        total=len(process_args),
+                        desc=f"Rank {rank}: Preparing layers"
+                    ))
                     
-                    # Process this chunk of layers in parallel with timeout
-                    try:
-                        results = list(tqdm(
-                            pool.imap_unordered(_process_single_layer, chunk_args),
-                            total=len(chunk_args),
-                            desc=f"Rank {rank}: Preparing layers (chunk {chunk_start//chunk_size + 1}/{(len(process_args) + chunk_size - 1)//chunk_size})"
-                        ))
+                    for layer_idx, replacements in results:
+                        for op_name, vqlinear in replacements.items():
+                            all_replacements[f'layers.{layer_idx}.{op_name}'] = (layer_idx, op_name, vqlinear)
+                    
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                         
-                        # Collect replacements from this chunk
-                        for layer_idx, replacements in results:
-                            for op_name, vqlinear in replacements.items():
-                                all_replacements[f'layers.{layer_idx}.{op_name}'] = (layer_idx, op_name, vqlinear)
-                        
-                        # Force garbage collection between chunks
-                        gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                            
-                    except Exception as e:
-                        if rank == 0:
-                            print(f"Warning: Chunk processing failed: {str(e)}, continuing with next chunk")
-                        continue
+                except Exception as e:
+                    if rank == 0:
+                        print(f"Warning: Processing failed: {str(e)}")
         except Exception as e:
             if rank == 0:
-                print(f"Warning: Multiprocessing execution failed: {str(e)}, falling back to sequential processing")
+                print(f"Warning: Multiprocessing failed: {str(e)}, using sequential processing")
             use_mp = False
             
     if not use_mp or processes_per_rank <= 1 or not all_replacements:
-        # Process layers sequentially but with optimized data structures
-        for args in tqdm(process_args, desc=f"Rank {rank}: Preparing layer replacements"):
+        for args in tqdm(process_args, desc=f"Rank {rank}: Sequential processing"):
             try:
                 layer_idx, replacements = _process_single_layer(args)
                 for op_name, vqlinear in replacements.items():
                     all_replacements[f'layers.{layer_idx}.{op_name}'] = (layer_idx, op_name, vqlinear)
             except Exception as e:
-                print(f"Warning: Failed to process layer {args[0]}: {str(e)}")
+                print(f"Warning: Failed to process layer {args[0]}")
                 continue
     
-    # OPTIMIZATION 4: Apply all replacements at once using direct access
     if rank == 0:
-        print(f"Applying {len(all_replacements)} layer replacements...")
+        print(f"Applying {len(all_replacements)} replacements")
     
-    # Group replacements by layer for more efficient processing
     layer_grouped_replacements = {}
     for full_name, (layer_idx, op_name, vqlinear) in all_replacements.items():
         if layer_idx not in layer_grouped_replacements:
             layer_grouped_replacements[layer_idx] = {}
         layer_grouped_replacements[layer_idx][op_name] = vqlinear
     
-    # Apply replacements layer by layer
-    for layer_idx, replacements in tqdm(layer_grouped_replacements.items(), desc=f"Rank {rank}: Applying replacements"):
+    for layer_idx, replacements in tqdm(layer_grouped_replacements.items(), desc=f"Rank {rank}: Applying"):
         try:
             batch_replace_layers(layers[layer_idx], replacements)
         except Exception as e:
-            print(f"Warning: Failed to apply replacements for layer {layer_idx}: {str(e)}")
+            print(f"Warning: Failed to apply replacements for layer {layer_idx}")
             continue
     
     elapsed = time.time() - start_time
-    # if rank == 0:
-    #    print(f'Layer replacement completed in {elapsed:.2f} seconds')
-    #    print(f'quantized model: {model}')
+    if rank == 0:
+        print(f'Completed in {elapsed:.2f}s')
     
     # load state dict
     model_state_dict = load_file(os.path.join(ckpt_path, f"model{rank}-mp{world_size}.safetensors"))
@@ -694,8 +672,8 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--input-file", type=str, default="")
     parser.add_argument("--interactive", action="store_true")
-    parser.add_argument("--max-new-tokens", type=int, default=4096)
-    parser.add_argument("--temperature", type=float, default=0.2)
+    parser.add_argument("--max-new-tokens", type=int, default=65536)
+    parser.add_argument("--temperature", type=float, default=0.15)
     parser.add_argument("--quantize", action="store_true")
     parser.add_argument("--quant-config", type=str, default="")
     args = parser.parse_args()
